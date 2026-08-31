@@ -326,6 +326,34 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
 .settings-grid{display:flex;flex-wrap:wrap;justify-content:center;gap:16px;max-width:1150px;width:100%;margin-bottom:15px;}
 .settings-grid .card{flex:1 1 260px;max-width:280px;margin:0;}
 .reboot-container{width:100%;max-width:1150px;display:flex;justify-content:center;}
+.file-upload-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #282828;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+  margin: 6px 0;
+  box-sizing: border-box;
+}
+.file-btn {
+  background: #3a3a3a;
+  color: #fff;
+  padding: 8px 12px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.file-btn:hover { background: #4a4a4a; }
+.file-name {
+  font-size: 12px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 </style></head><body>
 
 <!-- TOP STATUS BAR WITH ACCENT BADGES -->
@@ -412,7 +440,11 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
       <h3>System & OTA</h3>
       <div id="otastatus" style="color:#ffa500;"></div>
       <form id="otaForm" onsubmit="uploadOTA(event)">
-        <input type="file" id="otafile" name="update" accept=".bin"><br>
+        <input type="file" id="otafile" name="update" accept=".bin" style="display:none;" onchange="document.getElementById('fileName').innerText = this.files[0] ? this.files[0].name : 'No file chosen'">
+        <div class="file-upload-wrap">
+          <label for="otafile" class="file-btn">Choose file</label>
+          <span id="fileName" class="file-name">No file chosen</span>
+        </div>
         <button type="submit" style="width:100%; margin-top:8px;">Flash .bin</button>
       </form>
     </div>
