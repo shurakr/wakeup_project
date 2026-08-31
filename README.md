@@ -21,6 +21,14 @@ The highlight of this project is a 100% reliable **hardware wake-up from ACPI S3
 
 ---
 
+## 📸 Screenshots
+
+| Web Control | Web Settings | Home Assistant |
+| :---: | :---: | :---: |
+| ![Control](Control.png) | ![Settings](Settings.png) | ![Home Assistant](HA.png) |
+
+---
+
 ## 🛠 Hardware Requirements
 
 1.  **Board:** Any **ESP32-S3** development board.
