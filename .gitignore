@@ -1,0 +1,22 @@
+# Сборка и временные файлы Arduino
+/build/
+*.hex
+*.bin
+*.elf
+*.eep
+*.map
+*.lst
+*.sym
+
+# Настройки IDE и редакторов
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.iml
+*.sublime-workspace
+*.sublime-project
+
+# Временные файлы платформ и библиотек
+/.dep/
+/obj/
