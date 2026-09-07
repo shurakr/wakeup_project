@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "USB.h"
 #include "USBHID.h"
 #include "tusb.h"
@@ -8,15 +9,16 @@
 #include <ArduinoMqttClient.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_partition.h>
 
 // --- Firmware Version ---
-const String FIRMWARE_VERSION = "1.0";
+const String FIRMWARE_VERSION = "1.2";
 
 // --- Hardware Pins ---
-#define LED_PIN         21
 #define BOOT_BUTTON_PIN 0 
 
-Adafruit_NeoPixel strip(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+int ledPin = 21; // Значение по умолчанию, будет перезаписано при загрузке
+Adafruit_NeoPixel* strip = nullptr; // Динамический указатель для светодиода
 Preferences preferences;
 
 // --- Network & MQTT Settings ---
@@ -88,10 +90,31 @@ unsigned long lastNetworkCheck = 0;
 unsigned long lastWifiAttempt = 0;
 bool buttonHeld = false;
 
+// Host Power Tracking Variables
+unsigned long lastHostStatusCheck = 0;
+bool lastHostStatus = false;
+bool hostStatusInitialized = false;
+
+// Автоматическое определение платы
+void detectHardware() {
+  uint32_t flashBytes = ESP.getFlashChipSize();
+  uint32_t psramBytes = ESP.getPsramSize();
+
+  if (flashBytes > 4 * 1024 * 1024 || psramBytes > 4 * 1024 * 1024) {
+    ledPin = 48; // DevKitC-1 N16R8
+    Serial.println("Hardware Detected: ESP32-S3 N16R8 (LED GPIO48)");
+  } else {
+    ledPin = 21; // Waveshare S3-Zero
+    Serial.println("Hardware Detected: ESP32-S3 Zero (LED GPIO21)");
+  }
+}
+
 void setStatusColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 20) {
-  strip.setBrightness(brightness);
-  strip.setPixelColor(0, strip.Color(r, g, b));
-  strip.show();
+  if (strip != nullptr) {
+    strip->setBrightness(brightness);
+    strip->setPixelColor(0, strip->Color(r, g, b));
+    strip->show();
+  }
 }
 
 bool isAuthenticated() {
@@ -163,29 +186,36 @@ void safeKeyboardPrint(const String& text) {
   }
 }
 
+// Публикация статуса платы (с явным указанием длины пакета)
 void publishStatus(const char* state) {
   if (mqttClient.connected()) {
-    mqttClient.beginMessage("pc/status", false, 1, false);
-    mqttClient.print(state);
+    String s = String(state);
+    mqttClient.beginMessage("pc/status", (unsigned long)s.length(), true, 1, false);
+    mqttClient.print(s);
     mqttClient.endMessage();
   }
 }
 
+// Выполнение команд
 void executeCommand(String cmd) {
   if (millis() - lastActionTime < 150) return;
   lastActionTime = millis();
 
+  // === СИНХРОНИЗАЦИЯ С HOME ASSISTANT ===
+  if (mqttClient.connected()) {
+    mqttClient.beginMessage("pc/last_action", (unsigned long)cmd.length(), false, 1, false);
+    mqttClient.print(cmd);
+    mqttClient.endMessage();
+  }
+  // ======================================
+  
+  // --- PC CONTROL ---
   if (cmd == "wake") {
     if (tud_suspended()) {
       tud_remote_wakeup();
       unsigned long wait_start = millis();
-      while (tud_suspended() && (millis() - wait_start < 3000)) {
-        delay(50);
-      }
-      if (!tud_hid_ready()) {
-        publishStatus("wake_failed");
-        return; 
-      }
+      while (tud_suspended() && (millis() - wait_start < 3000)) { delay(50); }
+      if (!tud_hid_ready()) { return; }
     }
     sendMouseClick(0x01);
     delay(150);
@@ -194,51 +224,43 @@ void executeCommand(String cmd) {
     sendKeycode(0x2C);
     delay(80);
     sendKeycode(0x28);
-    publishStatus("woken");
   } 
-  else if (cmd == "sleep") {
-    sendAcpiCommand(0x02);
-    publishStatus("sleeping");
-  } 
-  else if (cmd == "power") {
-    sendAcpiCommand(0x01);
-    publishStatus("power_down");
-  } 
-  else if (cmd == "enter") {
-    sendKeycode(0x28); 
-    publishStatus("entered");
-  }
-  else if (cmd == "vol_up") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_INCREMENT);
-    publishStatus("vol_up");
-  }
-  else if (cmd == "vol_down") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_DECREMENT);
-    publishStatus("vol_down");
-  }
-  else if (cmd == "mute") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_MUTE);
-    publishStatus("muted");
-  }
-  else if (cmd == "play_pause") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE);
-    publishStatus("play_paused");
-  }
-  else if (cmd == "next") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_NEXT_TRACK);
-    publishStatus("next_track");
-  }
-  else if (cmd == "prev") {
-    sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_PREVIOUS_TRACK);
-    publishStatus("prev_track");
-  }
+  else if (cmd == "sleep") { sendAcpiCommand(0x02); } 
+  else if (cmd == "power") { sendAcpiCommand(0x01); } 
+  else if (cmd == "enter") { sendKeycode(0x28); }
+  
+  // --- MEDIA CONTROL ---
+  else if (cmd == "vol_up") { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_INCREMENT); }
+  else if (cmd == "vol_down") { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_DECREMENT); }
+  else if (cmd == "mute") { sendConsumerCommand(HID_USAGE_CONSUMER_MUTE); }
+  else if (cmd == "play_pause") { sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE); }
+  else if (cmd == "next") { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_NEXT); }
+  else if (cmd == "prev") { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_PREVIOUS); }
+  
+  // --- SAMSUNG TV CONTROL ---
+  else if (cmd == "tv_power") { sendConsumerCommand(0x0030); } 
+  else if (cmd == "tv_123") { sendConsumerCommand(0x0040); }     
+  else if (cmd == "tv_home") { sendKeycode(0x00, 0x08); }       
+  else if (cmd == "tv_back") { sendKeycode(0x29); }             
+  else if (cmd == "tv_play") { sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE); }
+  else if (cmd == "tv_ch_up") { sendConsumerCommand(0x009C); } 
+  else if (cmd == "tv_ch_down") { sendConsumerCommand(0x009D); } 
+  else if (cmd == "tv_up") { sendKeycode(0x52); }
+  else if (cmd == "tv_down") { sendKeycode(0x51); }
+  else if (cmd == "tv_left") { sendKeycode(0x50); }
+  else if (cmd == "tv_right") { sendKeycode(0x4F); }
+  else if (cmd == "tv_enter") { sendKeycode(0x28); }
+  else if (cmd == "tv_a") { sendKeycode(0x3A); } 
+  else if (cmd == "tv_b") { sendKeycode(0x3B); } 
+  else if (cmd == "tv_c") { sendKeycode(0x3C); } 
+  else if (cmd == "tv_d") { sendKeycode(0x3D); } 
 }
 
 // === 5. HOME ASSISTANT MQTT AUTO-DISCOVERY ===
 void publishButtonDiscovery(const String& subTopic, const String& name, const String& cmd, const String& icon, const String& devInfo) {
   String topic = "homeassistant/button/" + deviceId + "/" + subTopic + "/config";
   String payload = "{\"name\":\"" + name + "\",\"cmd_t\":\"pc/command\",\"payload_press\":\"" + cmd + "\",\"ic\":\"" + icon + "\",\"uniq_id\":\"" + deviceId + "_" + subTopic + "\"" + devInfo + "}";
-  mqttClient.beginMessage(topic, true, 1, false);
+  mqttClient.beginMessage(topic, (unsigned long)payload.length(), true, 1, false);
   mqttClient.print(payload);
   mqttClient.endMessage();
 }
@@ -248,28 +270,63 @@ void publishHADiscovery() {
 
   String devInfo = ",\"dev\":{\"ids\":[\"" + deviceId + "\"],\"name\":\"ESP32 PC Controller\",\"mf\":\"Logitech / ESP32\",\"mdl\":\"S3-HID-Media\",\"sw\":\"" + FIRMWARE_VERSION + "\"}";
 
+  // PC Buttons
   publishButtonDiscovery("wake", "Wake PC", "wake", "mdi:power-cycle", devInfo);
   publishButtonDiscovery("sleep", "Sleep PC", "sleep", "mdi:sleep", devInfo);
   publishButtonDiscovery("power", "Power Off PC", "power", "mdi:power", devInfo);
   publishButtonDiscovery("enter", "Send Enter", "enter", "mdi:keyboard-return", devInfo);
 
+  // Media Buttons
   publishButtonDiscovery("vol_up", "Volume Up", "vol_up", "mdi:volume-high", devInfo);
   publishButtonDiscovery("vol_down", "Volume Down", "vol_down", "mdi:volume-medium", devInfo);
   publishButtonDiscovery("mute", "Mute Audio", "mute", "mdi:volume-mute", devInfo);
   publishButtonDiscovery("play_pause", "Play / Pause", "play_pause", "mdi:play-pause", devInfo);
   publishButtonDiscovery("next", "Next Track", "next", "mdi:skip-next", devInfo);
   publishButtonDiscovery("prev", "Previous Track", "prev", "mdi:skip-previous", devInfo);
+  
+  // TV Buttons
+  publishButtonDiscovery("tv_power", "TV Power", "tv_power", "mdi:power", devInfo);
+  publishButtonDiscovery("tv_123", "TV 123 Menu", "tv_123", "mdi:numeric", devInfo);
+  publishButtonDiscovery("tv_home", "TV Smart Hub", "tv_home", "mdi:home", devInfo);
+  publishButtonDiscovery("tv_back", "TV Back", "tv_back", "mdi:keyboard-return", devInfo);
+  publishButtonDiscovery("tv_play", "TV Play/Pause", "tv_play", "mdi:play-pause", devInfo);
+  publishButtonDiscovery("tv_ch_up", "TV CH Up", "tv_ch_up", "mdi:chevron-up-box", devInfo);
+  publishButtonDiscovery("tv_ch_down", "TV CH Down", "tv_ch_down", "mdi:chevron-down-box", devInfo);
+  publishButtonDiscovery("tv_up", "TV Up", "tv_up", "mdi:arrow-up-bold", devInfo);
+  publishButtonDiscovery("tv_down", "TV Down", "tv_down", "mdi:arrow-down-bold", devInfo);
+  publishButtonDiscovery("tv_left", "TV Left", "tv_left", "mdi:arrow-left-bold", devInfo);
+  publishButtonDiscovery("tv_right", "TV Right", "tv_right", "mdi:arrow-right-bold", devInfo);
+  publishButtonDiscovery("tv_a", "TV Red", "tv_a", "mdi:alpha-a-box", devInfo);
+  publishButtonDiscovery("tv_b", "TV Green", "tv_b", "mdi:alpha-b-box", devInfo);
+  publishButtonDiscovery("tv_c", "TV Yellow", "tv_c", "mdi:alpha-c-box", devInfo);
+  publishButtonDiscovery("tv_d", "TV Blue", "tv_d", "mdi:alpha-d-box", devInfo);
 
+  // Status Sensor (Text)
   String topicStatus = "homeassistant/sensor/" + deviceId + "/status/config";
-  String payloadStatus = "{\"name\":\"PC Status\",\"stat_t\":\"pc/status\",\"ic\":\"mdi:information-outline\",\"uniq_id\":\"" + deviceId + "_status\"" + devInfo + "}";
-  mqttClient.beginMessage(topicStatus, true, 1, false);
+  String payloadStatus = "{\"name\":\"Board Status\",\"stat_t\":\"pc/status\",\"ic\":\"mdi:information-outline\",\"uniq_id\":\"" + deviceId + "_status\"" + devInfo + "}";
+  mqttClient.beginMessage(topicStatus, (unsigned long)payloadStatus.length(), true, 1, false);
   mqttClient.print(payloadStatus);
   mqttClient.endMessage();
 
+  // Type Text Entity
   String topicText = "homeassistant/text/" + deviceId + "/type/config";
   String payloadText = "{\"name\":\"Type Text\",\"cmd_t\":\"pc/type\",\"mode\":\"text\",\"ic\":\"mdi:keyboard-outline\",\"uniq_id\":\"" + deviceId + "_text\"" + devInfo + "}";
-  mqttClient.beginMessage(topicText, true, 1, false);
+  mqttClient.beginMessage(topicText, (unsigned long)payloadText.length(), true, 1, false);
   mqttClient.print(payloadText);
+  mqttClient.endMessage();
+
+  // Host Power Binary Sensor (ON/OFF)
+  String topicHostPower = "homeassistant/binary_sensor/" + deviceId + "/host_power/config";
+  String payloadHostPower = "{\"name\":\"Host Power\",\"stat_t\":\"pc/host_power\",\"dev_cla\":\"power\",\"uniq_id\":\"" + deviceId + "_host_power\"" + devInfo + "}";
+  mqttClient.beginMessage(topicHostPower, (unsigned long)payloadHostPower.length(), true, 1, false);
+  mqttClient.print(payloadHostPower);
+  mqttClient.endMessage();
+
+  // Sensor "Last Action"
+  String topicLastAction = "homeassistant/sensor/" + deviceId + "/last_action/config";
+  String payloadLastAction = "{\"name\":\"Last Action\",\"stat_t\":\"pc/last_action\",\"ic\":\"mdi:history\",\"uniq_id\":\"" + deviceId + "_last_action\"" + devInfo + "}";
+  mqttClient.beginMessage(topicLastAction, (unsigned long)payloadLastAction.length(), true, 1, false);
+  mqttClient.print(payloadLastAction);
   mqttClient.endMessage();
 }
 
@@ -317,6 +374,26 @@ button{padding:11px;font-size:13px;background:var(--primary);color:#fff;border:n
 button:hover{opacity:0.9;}
 button:active{transform:scale(0.98);}
 .btn-red{background:var(--danger);width:100%;max-width:320px;margin:10px auto 0;display:block;}
+
+/* TV REMOTE SPECIFIC STYLES */
+.tv-remote{background:#1a1a1a; border-radius:30px; padding:25px 20px; box-shadow:inset 0 0 10px rgba(0,0,0,0.8), 0 4px 15px rgba(0,0,0,0.6); max-width:320px; width:100%; border:1px solid #333;}
+.tv-top-row{display:flex; justify-content:space-between; margin-bottom:15px;}
+.tv-top-row button{border-radius:50%; width:45px; height:45px; display:flex; align-items:center; justify-content:center; font-weight:bold;}
+.btn-tv-123{background:#333;}
+.btn-tv-power{background:#d32f2f;}
+.color-grid{display:grid;grid-template-columns:repeat(4, 1fr);gap:8px;margin-bottom:15px;}
+.btn-tv-red{background:#d32f2f;} .btn-tv-green{background:#388e3c;} .btn-tv-yellow{background:#fbc02d;color:#000;} .btn-tv-blue{background:#1976d2;}
+.dpad-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:20px;justify-items:center;align-items:center;}
+.dpad-grid button{width:100%;height:55px;border-radius:12px;display:flex;justify-content:center;align-items:center;font-size:18px;background:#252525;border:1px solid #444;}
+.dpad-grid button:active{background:#444;}
+.tv-func-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px;}
+.tv-func-row button{background:#252525; border:1px solid #444; border-radius:12px; height:45px; font-size:16px;}
+.rocker-container{display:grid; grid-template-columns:1fr 1fr; gap:20px;}
+.rocker{background:#252525; border:1px solid #444; border-radius:20px; padding:6px; display:flex; flex-direction:column; gap:5px;}
+.rocker button{background:transparent; border:none; height:40px; font-size:18px;}
+.rocker button:hover{background:#333;}
+.rocker-label{text-align:center; font-size:12px; color:#888; padding:8px 0; font-weight:bold;}
+
 input{padding:11px;margin:6px 0;width:100%;font-size:14px;background:#282828;color:#fff;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;}
 input:focus{border-color:var(--primary);outline:none;}
 .tab-content{width:100%;display:flex;flex-direction:column;align-items:center;}
@@ -326,50 +403,28 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
 .settings-grid{display:flex;flex-wrap:wrap;justify-content:center;gap:16px;max-width:1150px;width:100%;margin-bottom:15px;}
 .settings-grid .card{flex:1 1 260px;max-width:280px;margin:0;}
 .reboot-container{width:100%;max-width:1150px;display:flex;justify-content:center;}
-.file-upload-wrap {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #282828;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px;
-  margin: 6px 0;
-  box-sizing: border-box;
-}
-.file-btn {
-  background: #3a3a3a;
-  color: #fff;
-  padding: 8px 12px;
-  font-size: 12px;
-  border-radius: 4px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.file-btn:hover { background: #4a4a4a; }
-.file-name {
-  font-size: 12px;
-  color: #aaa;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+
+.file-upload-wrap {display:flex;align-items:center;gap:8px;background:#282828;border:1px solid var(--border);border-radius:6px;padding:6px;margin:6px 0;box-sizing:border-box;}
+.file-btn {background:#3a3a3a;color:#fff;padding:8px 12px;font-size:12px;border-radius:4px;cursor:pointer;white-space:nowrap;}
+.file-btn:hover {background:#4a4a4a;}
+.file-name {font-size:12px;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 </style></head><body>
 
-<!-- TOP STATUS BAR WITH ACCENT BADGES -->
 <div class="status-bar">
   <div class="badge">Version: <b>v%VER%</b></div>
   <div class="badge">IP: <b>%IP%</b></div>
-  <div class="badge">Wi-Fi: <b>%SSID%</b></div>
+  <div class="badge">Wi-Fi: %WIFI_STATUS%</div>
   <div class="badge">MQTT: %MQTT_STATUS%</div>
+  <div class="badge">Host: %HOST_STATUS%</div>
 </div>
 
 <div class="nav">
-  <button class="nav-btn active" onclick="switchTab('tab-control', this)">🎮 Control</button>
+  <button class="nav-btn active" onclick="switchTab('tab-control', this)">🎮 Control PC</button>
+  <button class="nav-btn" onclick="switchTab('tab-tv', this)">📺 Samsung TV</button>
   <button class="nav-btn" onclick="switchTab('tab-settings', this)">⚙️ Settings</button>
 </div>
 
-<!-- TAB 1: CONTROL (CENTERED) -->
+<!-- TAB 1: CONTROL PC -->
 <div id="tab-control" class="tab-content">
   <div class="card" style="max-width:360px; width:100%;">
     <h3>PC Power & Input</h3>
@@ -398,10 +453,56 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
   </div>
 </div>
 
-<!-- TAB 2: SETTINGS (CENTERED GRID) -->
+<!-- TAB 2: SAMSUNG TV REMOTE -->
+<div id="tab-tv" class="tab-content hidden">
+  <div class="tv-remote">
+    <div class="tv-top-row">
+      <button class="btn-tv-123" onclick="fetch('/tv_123')">123</button>
+      <button class="btn-tv-power" onclick="fetch('/tv_power')" style="display:flex; align-items:center; justify-content:center;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+      </button>
+    </div>
+    <div class="color-grid">
+      <button class="btn-tv-red" onclick="fetch('/tv_a')"></button>
+      <button class="btn-tv-green" onclick="fetch('/tv_b')"></button>
+      <button class="btn-tv-yellow" onclick="fetch('/tv_c')"></button>
+      <button class="btn-tv-blue" onclick="fetch('/tv_d')"></button>
+    </div>
+    <div class="dpad-grid">
+      <div style="visibility:hidden;"></div>
+      <button onclick="fetch('/tv_up')">▲</button>
+      <div style="visibility:hidden;"></div>
+      <button onclick="fetch('/tv_left')">◀</button>
+      <button onclick="fetch('/tv_enter')" style="font-weight:bold; background:#3a3a3a; color:#fff;">OK</button>
+      <button onclick="fetch('/tv_right')">▶</button>
+      <div style="visibility:hidden;"></div>
+      <button onclick="fetch('/tv_down')">▼</button>
+      <div style="visibility:hidden;"></div>
+    </div>
+    <div class="tv-func-row">
+      <button onclick="fetch('/tv_back')">↩</button>
+      <button onclick="fetch('/tv_home')">🏠</button>
+      <button onclick="fetch('/tv_play')">⏯</button>
+    </div>
+    <div class="rocker-container">
+      <div class="rocker">
+        <button onclick="fetch('/vol_up')">+</button>
+        <div class="rocker-label">VOL</div>
+        <button onclick="fetch('/vol_down')">-</button>
+        <button onclick="fetch('/mute')" style="font-size:12px; margin-top:5px; height:30px; border-top:1px solid #444; border-radius:0;">MUTE</button>
+      </div>
+      <div class="rocker">
+        <button onclick="fetch('/tv_ch_up')">∧</button>
+        <div class="rocker-label">CH</div>
+        <button onclick="fetch('/tv_ch_down')">∨</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB 3: SETTINGS -->
 <div id="tab-settings" class="tab-content hidden">
   <div class="settings-grid">
-    <!-- 1. Network Settings -->
     <div class="card">
       <h3>Wi-Fi Network</h3>
       <form action="/save_wifi" method="POST" autocomplete="off" onsubmit="return checkPasswords(this.pass.value, this.pass2.value)">
@@ -412,7 +513,6 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
       </form>
     </div>
 
-    <!-- 2. MQTT Settings -->
     <div class="card">
       <h3>MQTT Broker</h3>
       <form action="/save_mqtt" method="POST" autocomplete="off">
@@ -424,7 +524,6 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
       </form>
     </div>
 
-    <!-- 3. Web Auth -->
     <div class="card">
       <h3>Web Security</h3>
       <form action="/save_auth" method="POST" autocomplete="off" onsubmit="return checkPasswords(this.web_pass.value, this.web_pass2.value)">
@@ -435,7 +534,6 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
       </form>
     </div>
 
-    <!-- 4. System & OTA -->
     <div class="card">
       <h3>System & OTA</h3>
       <div id="otastatus" style="color:#ffa500;"></div>
@@ -527,25 +625,32 @@ void onMqttMessage(int messageSize) {
     executeCommand(payload);
   } else if (topic == "pc/type") {
     safeKeyboardPrint(payload);
-    publishStatus("typed");
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  
+  // Автоопределение железа и динамическое создание светодиода
+  detectHardware();
+  strip = new Adafruit_NeoPixel(1, ledPin, NEO_GRB + NEO_KHZ800);
+  strip->begin();
+  setStatusColor(255, 140, 0); // Orange = Booting
+
   sessionToken = String(esp_random(), HEX);
-  Serial.println("\nBooting... Firmware Version: " + FIRMWARE_VERSION);
+  Serial.println("\n--- ESP32-S3 Controller Booting ---");
+  Serial.println("Firmware Version: " + FIRMWARE_VERSION);
 
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char idBuf[16];
   snprintf(idBuf, sizeof(idBuf), "esp32_%02X%02X%02X", mac[3], mac[4], mac[5]);
   deviceId = String(idBuf);
+  Serial.println("Device ID: " + deviceId);
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-  strip.begin();
-  setStatusColor(255, 140, 0); 
 
+  // Load preferences
   preferences.begin("cfg", false);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("pass", "");
@@ -560,39 +665,45 @@ void setup() {
   if (savedPass.length() > 0) webPass = savedPass;
   preferences.end();
 
-  // === TOTAL KEYBOARD + MEDIA INIT ===
+  // === INIT USB ===
   USB.VID(0x046D); 
   USB.PID(0xC323); 
-  USB.productName("Logitech Total Keyboard V5.4");
+  USB.productName("Logitech Total Keyboard V1.2");
   USB.manufacturerName("Logitech");
-
-  USB.usbAttributes(0xA0); 
+  USB.usbAttributes(0xA0); // WAKEUP FLAG
 
   TotalKB.begin();
   HID.begin();
   USB.begin();
-  // ====================================
+  Serial.println("USB HID Stack Initialized.");
 
+  // Connect to Wi-Fi
   if (ssid.length() > 0) {
+    Serial.print("Connecting to Wi-Fi: ");
+    Serial.println(ssid);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid.c_str(), password.c_str());
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
       delay(300);
+      Serial.print(".");
     }
+    Serial.println();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Failed to connect to Wi-Fi. Starting Access Point mode.");
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-Setup-AP", "12345678");
-    setStatusColor(255, 0, 0); 
+    setStatusColor(255, 0, 0); // Red = AP Mode / Error
   } else {
-    setStatusColor(0, 0, 255); 
-    Serial.print("Connected to Wi-Fi. IP: ");
+    setStatusColor(0, 0, 255); // Blue = Wi-Fi Connected
+    Serial.print("Connected! IP Address: ");
     Serial.println(WiFi.localIP());
   }
 
+  // --- Web Server Endpoints ---
   server.on("/", []() {
     if (!isAuthenticated()) { 
       server.send(200, "text/html", loginPage); 
@@ -602,14 +713,25 @@ void setup() {
     String page = mainPage;
     String currentIP = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "192.168.4.1 (AP Mode)";
     String currentSSID = (ssid.length() > 0) ? ssid : "Not Set";
+    
+    String wifiStatusBadge = (WiFi.status() == WL_CONNECTED) 
+      ? "<span class='dot dot-green'></span> <b>" + currentSSID + "</b>" 
+      : String("<span class='dot dot-red'></span> <b>") + ((ssid.length() > 0) ? "Offline" : "AP Mode") + "</b>";
+
     String mqttStatusBadge = mqttClient.connected() 
       ? "<span class='dot dot-green'></span> <b>Connected</b>" 
       : "<span class='dot dot-red'></span> <b>Disconnected</b>";
+      
+    String hostStatusBadge = lastHostStatus 
+      ? "<span class='dot dot-green'></span> <b>ON</b>" 
+      : "<span class='dot dot-red'></span> <b>OFF</b>";
     
     page.replace("%VER%", FIRMWARE_VERSION);
     page.replace("%IP%", currentIP);
     page.replace("%SSID%", currentSSID);
+    page.replace("%WIFI_STATUS%", wifiStatusBadge);
     page.replace("%MQTT_STATUS%", mqttStatusBadge);
+    page.replace("%HOST_STATUS%", hostStatusBadge);
     
     page.replace("%MQTT%", mqttServer);
     page.replace("%MQTT_PORT%", String(mqttPort));
@@ -632,92 +754,65 @@ void setup() {
     }
   });
 
-  // Separate Wi-Fi Save Endpoint
   server.on("/save_wifi", HTTP_POST, []() {
     if (!isAuthenticated()) { server.send(401); return; }
-    
-    String p = server.arg("pass");
+    String p = server.arg("pass"); 
     String p2 = server.arg("pass2");
+    if (p != "********" && p.length() > 0 && p != p2) { server.send(400, "text/plain", "Error: Passwords do not match"); return; }
     
-    if (p != "********" && p.length() > 0 && p != p2) {
-      server.send(400, "text/plain; charset=utf-8", "Error: Wi-Fi passwords do not match");
-      return;
-    }
-
     preferences.begin("cfg", false);
     preferences.putString("ssid", server.arg("ssid"));
-    if (p != "********" && p.length() > 0) {
-      preferences.putString("pass", p); 
-    }
+    if (p != "********" && p.length() > 0) { preferences.putString("pass", p); }
     preferences.end();
     
-    String html = "<meta charset=\"utf-8\"><h3>Wi-Fi Saved. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>";
-    server.send(200, "text/html", html);
-    delay(1000);
-    ESP.restart();
+    server.send(200, "text/html", "<meta charset=\"utf-8\"><h3>Wi-Fi Saved. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>");
+    delay(1000); ESP.restart();
   });
 
-  // Separate MQTT Save Endpoint
   server.on("/save_mqtt", HTTP_POST, []() {
     if (!isAuthenticated()) { server.send(401); return; }
-
+    
     preferences.begin("cfg", false);
     preferences.putString("mqtt", server.arg("mqtt"));
     int portVal = server.arg("mqtt_port").toInt();
     preferences.putInt("mqtt_port", portVal > 0 ? portVal : 1883);
-    
     preferences.putString("mqtt_u", server.arg("mqtt_user"));
-    
     String mp = server.arg("mqtt_pass");
-    if (mp != "********") {
-      preferences.putString("mqtt_p", mp);
-    }
+    if (mp != "********") { preferences.putString("mqtt_p", mp); }
     preferences.end();
     
-    String html = "<meta charset=\"utf-8\"><h3>MQTT Saved. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>";
-    server.send(200, "text/html", html);
-    delay(1000);
-    ESP.restart();
+    server.send(200, "text/html", "<meta charset=\"utf-8\"><h3>MQTT Saved. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>");
+    delay(1000); ESP.restart();
   });
 
-  // Separate Auth Save Endpoint
   server.on("/save_auth", HTTP_POST, []() {
     if (!isAuthenticated()) { server.send(401); return; }
-    
-    String wp = server.arg("web_pass");
+    String wp = server.arg("web_pass"); 
     String wp2 = server.arg("web_pass2");
+    if (wp != "********" && wp.length() > 0 && wp != wp2) { server.send(400, "text/plain", "Error: Passwords do not match"); return; }
     
-    if (wp != "********" && wp.length() > 0 && wp != wp2) {
-      server.send(400, "text/plain; charset=utf-8", "Error: Passwords do not match");
-      return;
-    }
-
     preferences.begin("cfg", false);
-    if (server.arg("web_user").length() > 0) preferences.putString("wUser", server.arg("web_user"));
-    if (wp != "********" && wp.length() > 0) {
-      preferences.putString("wPass", wp);
-    }
+    if (server.arg("web_user").length() > 0) { preferences.putString("wUser", server.arg("web_user")); }
+    if (wp != "********" && wp.length() > 0) { preferences.putString("wPass", wp); }
     preferences.end();
     
-    String html = "<meta charset=\"utf-8\"><h3>Auth Updated. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>";
-    server.send(200, "text/html", html);
-    delay(1000);
-    ESP.restart();
+    server.send(200, "text/html", "<meta charset=\"utf-8\"><h3>Auth Updated. Rebooting...</h3><script>setTimeout(()=>location.href='/', 6000);</script>");
+    delay(1000); ESP.restart();
   });
 
   server.on("/reboot", []() {
     if (!isAuthenticated()) { server.send(401); return; }
-    server.send(200, "text/plain", "OK");
-    delay(500);
-    ESP.restart();
+    Serial.println("Reboot command received.");
+    server.send(200, "text/plain", "OK"); delay(500); ESP.restart();
   });
 
-  // Action Endpoints
+  // Action Endpoints: PC
   server.on("/wake",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("wake"); server.send(200,"text/plain","OK"); });
   server.on("/sleep", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("sleep"); server.send(200,"text/plain","OK"); });
   server.on("/power", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("power"); server.send(200,"text/plain","OK"); });
   server.on("/enter", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("enter"); server.send(200,"text/plain","OK"); });
 
+  // Action Endpoints: Media
   server.on("/vol_up",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("vol_up"); server.send(200,"text/plain","OK"); });
   server.on("/vol_down",   []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("vol_down"); server.send(200,"text/plain","OK"); });
   server.on("/mute",       []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("mute"); server.send(200,"text/plain","OK"); });
@@ -725,49 +820,61 @@ void setup() {
   server.on("/next",       []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("next"); server.send(200,"text/plain","OK"); });
   server.on("/prev",       []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("prev"); server.send(200,"text/plain","OK"); });
 
+  // Action Endpoints: Samsung TV
+  server.on("/tv_power", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_power"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_123",   []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_123"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_home",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_home"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_back",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_back"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_play",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_play"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_ch_up", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_ch_up"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_ch_down",[]() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_ch_down"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_up",    []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_up"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_down",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_down"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_left",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_left"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_right", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_right"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_enter", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_enter"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_a",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_a"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_b",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_b"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_c",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_c"); server.send(200,"text/plain","OK"); });
+  server.on("/tv_d",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("tv_d"); server.send(200,"text/plain","OK"); });
+
   server.on("/type",  []() {
     if(!isAuthenticated()){server.send(401);return;}
     if(server.hasArg("text")) {
       safeKeyboardPrint(server.arg("text"));
-      publishStatus("typed");
     }
     server.send(200, "text/plain", "OK");
   });
 
+  // OTA Update
   server.on("/update", HTTP_POST, []() {
     if (!isAuthenticated()) { server.send(401, "text/plain", "Unauthorized"); return; }
     server.sendHeader("Connection", "close");
     server.send(200, "text/plain", (Update.hasError()) ? "UPDATE ERROR" : "SUCCESS");
-    delay(500);
+    delay(500); 
     ESP.restart();
   }, []() {
-    if (!isAuthenticated()) {
-      Update.abort();
-      return;
+    if (!isAuthenticated()) { 
+      Update.abort(); 
+      return; 
     }
-    
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update Start: %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-        Update.printError(Serial);
-      }
+      Serial.printf("OTA Update Start: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial); }
     } else if (upload.status == UPLOAD_FILE_END) {
       if (Update.end(true)) {
-        Serial.printf("Update Success: %u bytes\n", upload.totalSize);
-      } else {
-        Update.printError(Serial);
-      }
+        Serial.printf("OTA Update Success: %u bytes\n", upload.totalSize);
+      } else { Update.printError(Serial); }
     }
   });
 
   const char* headerkeys[] = {"Cookie"};
   server.collectHeaders(headerkeys, 1);
   server.begin();
+  Serial.println("HTTP Server started.");
 
   if (mqttServer.length() > 0) {
     mqttClient.onMessage(onMqttMessage);
@@ -777,16 +884,17 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // Hardware Factory Reset Check
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
     if (!buttonHeld) {
       buttonHeld = true;
       buttonPressTime = millis();
     } else if (millis() - buttonPressTime > 5000) {
       setStatusColor(255, 0, 0, 50);
+      Serial.println("Factory Reset! Clearing preferences and rebooting...");
       preferences.begin("cfg", false);
       preferences.clear();
       preferences.end();
-      Serial.println("Factory Reset! Rebooting...");
       delay(1000);
       ESP.restart();
     }
@@ -794,6 +902,7 @@ void loop() {
     buttonHeld = false;
   }
 
+  // Network & MQTT Connection Manager (checks every 4 seconds)
   if (millis() - lastNetworkCheck > 4000) {
     lastNetworkCheck = millis();
 
@@ -802,34 +911,73 @@ void loop() {
         setStatusColor(255, 140, 0); 
         if (millis() - lastWifiAttempt > 15000) {
           lastWifiAttempt = millis();
-          Serial.println("Attempting Wi-Fi reconnection...");
+          Serial.println("Wi-Fi disconnected. Attempting to reconnect...");
           WiFi.begin(ssid.c_str(), password.c_str());
         }
       } else {
         if (mqttServer.length() > 0 && !mqttClient.connected()) {
           setStatusColor(0, 0, 255); 
-          Serial.println("Connecting to MQTT...");
+          Serial.println("Connecting to MQTT broker...");
           
-          if (mqttUser.length() > 0) {
-            mqttClient.setUsernamePassword(mqttUser, mqttPass);
+          if (mqttUser.length() > 0) { 
+            mqttClient.setUsernamePassword(mqttUser, mqttPass); 
           }
+
+          // === НАСТРОЙКА LWT (LAST WILL) ===
+          mqttClient.beginWill("pc/status", 7, true, 1);
+          mqttClient.print("offline");
+          mqttClient.endWill();
+          // =================================
           
+          // === УВЕЛИЧЕНИЕ БУФЕРА ДЛЯ DISCOVERY ===
+          mqttClient.setTxPayloadSize(1024);
+          // =======================================
+
           if (mqttClient.connect(mqttServer.c_str(), mqttPort)) {
+            Serial.println("MQTT Connected! Subscribing and publishing discovery...");
+            
+            // 1. Сразу отправляем статус, пока буфер MQTT свободен!
+            publishStatus("online");
+            mqttClient.poll(); // Даем библиотеке команду немедленно протолкнуть пакет
+            
+            // 2. Только теперь подписываемся и шлем тяжелые конфигурации
             mqttClient.subscribe("pc/command");
             mqttClient.subscribe("pc/type");
-            
             publishHADiscovery();
             
-            publishStatus("online");
-            setStatusColor(0, 255, 0); 
-            Serial.println("MQTT Connected & HA Entities Discovered!");
+            setStatusColor(0, 255, 0); // Green = Fully connected
+          } else {
+            Serial.print("MQTT Connection failed! Error code: ");
+            Serial.println(mqttClient.connectError());
           }
         }
       }
     }
   }
 
+  // Handle incoming MQTT messages
   if (mqttClient.connected()) {
     mqttClient.poll();
+    
+    // --- HOST POWER TRACKING (tud_mounted) ---
+    // Checks every 1 second to see if the host (TV/PC) is supplying power/data to the USB port
+    if (millis() - lastHostStatusCheck > 1000) {
+      lastHostStatusCheck = millis();
+      bool currentHostStatus = tud_mounted() && !tud_suspended();
+      
+      if (currentHostStatus != lastHostStatus || !hostStatusInitialized) {
+        lastHostStatus = currentHostStatus;
+        hostStatusInitialized = true;
+        
+        Serial.print("Host Power State Changed: ");
+        Serial.println(currentHostStatus ? "ON" : "OFF");
+        
+        // Publish state to MQTT with Retain = true
+        String hpState = currentHostStatus ? "ON" : "OFF";
+        mqttClient.beginMessage("pc/host_power", (unsigned long)hpState.length(), true, 1, false); 
+        mqttClient.print(hpState);
+        mqttClient.endMessage();
+      }
+    }
   }
 }

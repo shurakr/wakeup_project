@@ -1,22 +1,25 @@
-# Сборка и временные файлы Arduino
-/build/
-*.hex
-*.bin
-*.elf
-*.eep
-*.map
-*.lst
-*.sym
+# =========================
+# PlatformIO
+# =========================
+.pio/
+.piodebugcore/
+libdeps/
 
-# Настройки IDE и редакторов
-.DS_Store
-Thumbs.db
+# =========================
+# VS Code / IDE
+# =========================
 .vscode/
-.idea/
-*.iml
-*.sublime-workspace
-*.sublime-project
+*.code-workspace
+/.idea/
 
-# Временные файлы платформ и библиотек
-/.dep/
-/obj/
+# =========================
+# OS generated files
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
