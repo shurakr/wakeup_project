@@ -1,4 +1,20 @@
 #include <Arduino.h>
+
+/* 
+  НАСТРОЙКИ ДЛЯ ПРОШИВКИ WAVESHARE ESP32-S3-ZERO:
+  - Board: ESP32S3 Dev Module
+  - Partition Scheme: Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)
+  - PSRAM: Enabled
+  - Flash Mode: QIO 80MHz
+  - USB Mode: USB-OTG (TinyUSB)  <-- КРИТИЧНО!
+  - USB CDC On Boot: Disabled
+  - Upload Mode: UART0 / Hardware CDC
+  
+  ДЛЯ ПЛАТЫ N16R8 (Дополнительно):
+  - Partition Scheme: 16M Flash (3MB APP/9.9MB FATFS)
+  - PSRAM: OPI PSRAM
+*/
+
 #include "USB.h"
 #include "USBHID.h"
 #include "tusb.h"
@@ -12,13 +28,28 @@
 #include <esp_partition.h>
 
 // --- Firmware Version ---
-const String FIRMWARE_VERSION = "1.2";
+const String FIRMWARE_VERSION = "1.4";
 
 // --- Hardware Pins ---
 #define BOOT_BUTTON_PIN 0 
 
-int ledPin = 21; // Значение по умолчанию, будет перезаписано при загрузке
-Adafruit_NeoPixel* strip = nullptr; // Динамический указатель для светодиода
+// --- Строгие прототипы для обхода багов парсера Arduino IDE ---
+void detectHardware();
+void setStatusColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 20);
+bool isAuthenticated();
+void sendMouseClick(uint8_t button);
+void sendAcpiCommand(uint8_t acpi_cmd);
+void sendConsumerCommand(uint16_t media_cmd);
+void sendKeycode(uint8_t keycode, uint8_t modifiers);
+void safeKeyboardPrint(const String& text);
+void publishStatus(const char* state);
+void executeCommand(String cmd);
+void publishButtonDiscovery(const String& subTopic, const String& name, const String& cmd, const String& icon, const String& devInfo);
+void publishHADiscovery();
+
+// --- Globals ---
+int ledPin = 21; 
+Adafruit_NeoPixel* strip = nullptr; 
 Preferences preferences;
 
 // --- Network & MQTT Settings ---
@@ -109,7 +140,7 @@ void detectHardware() {
   }
 }
 
-void setStatusColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 20) {
+void setStatusColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
   if (strip != nullptr) {
     strip->setBrightness(brightness);
     strip->setPixelColor(0, strip->Color(r, g, b));
@@ -125,7 +156,7 @@ bool isAuthenticated() {
 }
 
 // === 4. INPUT FUNCTIONS WITH OVERFLOW PROTECTION ===
-void sendMouseClick(uint8_t button = 0x01) {
+void sendMouseClick(uint8_t button) {
   if (!tud_hid_ready()) return;
   custom_ms_report_t report = { button, 0, 0, 0 };
   HID.SendReport(REPORT_ID_MOUSE, &report, sizeof(report));
@@ -150,7 +181,7 @@ void sendConsumerCommand(uint16_t media_cmd) {
   HID.SendReport(REPORT_ID_CONSUMER, &empty, sizeof(empty));
 }
 
-void sendKeycode(uint8_t keycode, uint8_t modifiers = 0) {
+void sendKeycode(uint8_t keycode, uint8_t modifiers) {
   if (!tud_hid_ready()) return; 
   custom_kb_report_t report = { modifiers, 0, { keycode, 0, 0, 0, 0, 0 } };
   HID.SendReport(REPORT_ID_KEYBOARD, &report, sizeof(report));
@@ -179,6 +210,7 @@ void safeKeyboardPrint(const String& text) {
     else if (c == '.') keycode = 0x37;
     else if (c == ',') keycode = 0x36;
     else if (c == '-') keycode = 0x2D;
+    else if (c == '/') keycode = 0x38; // Поддержка слэша для системных команд
     else if (c == '_') { keycode = 0x2D; mod = 0x02; }
     else if (c == '!') { keycode = 0x1E; mod = 0x02; }
 
@@ -186,7 +218,6 @@ void safeKeyboardPrint(const String& text) {
   }
 }
 
-// Публикация статуса платы (с явным указанием длины пакета)
 void publishStatus(const char* state) {
   if (mqttClient.connected()) {
     String s = String(state);
@@ -196,7 +227,6 @@ void publishStatus(const char* state) {
   }
 }
 
-// Выполнение команд
 void executeCommand(String cmd) {
   if (millis() - lastActionTime < 150) return;
   lastActionTime = millis();
@@ -207,7 +237,6 @@ void executeCommand(String cmd) {
     mqttClient.print(cmd);
     mqttClient.endMessage();
   }
-  // ======================================
   
   // --- PC CONTROL ---
   if (cmd == "wake") {
@@ -221,39 +250,52 @@ void executeCommand(String cmd) {
     delay(150);
     sendAcpiCommand(0x03);
     delay(150);
-    sendKeycode(0x2C);
+    sendKeycode(0x2C, 0);
     delay(80);
-    sendKeycode(0x28);
+    sendKeycode(0x28, 0);
   } 
   else if (cmd == "sleep") { sendAcpiCommand(0x02); } 
   else if (cmd == "power") { sendAcpiCommand(0x01); } 
-  else if (cmd == "enter") { sendKeycode(0x28); }
+  else if (cmd == "enter") { sendKeycode(0x28, 0); }
   
+  // --- PC HOTKEYS & MACROS ---
+  else if (cmd == "ctrl_alt_del") { sendKeycode(0x4C, 0x01 | 0x04); }
+  else if (cmd == "win_l")        { sendKeycode(0x0F, 0x08); }
+  else if (cmd == "taskmgr")      { sendKeycode(0x29, 0x01 | 0x02); }
+  else if (cmd == "alt_f4")       { sendKeycode(0x3D, 0x04); }
+  else if (cmd == "reboot_pc") { 
+    sendKeycode(0x15, 0x08); // Win + R
+    delay(400);              
+    safeKeyboardPrint("shutdown /r /t 0"); 
+    delay(100);
+    sendKeycode(0x28, 0);    // Enter
+  }
+
   // --- MEDIA CONTROL ---
-  else if (cmd == "vol_up") { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_INCREMENT); }
-  else if (cmd == "vol_down") { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_DECREMENT); }
-  else if (cmd == "mute") { sendConsumerCommand(HID_USAGE_CONSUMER_MUTE); }
+  else if (cmd == "vol_up")     { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_INCREMENT); }
+  else if (cmd == "vol_down")   { sendConsumerCommand(HID_USAGE_CONSUMER_VOLUME_DECREMENT); }
+  else if (cmd == "mute")       { sendConsumerCommand(HID_USAGE_CONSUMER_MUTE); }
   else if (cmd == "play_pause") { sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE); }
-  else if (cmd == "next") { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_NEXT); }
-  else if (cmd == "prev") { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_PREVIOUS); }
+  else if (cmd == "next")       { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_NEXT); }
+  else if (cmd == "prev")       { sendConsumerCommand(HID_USAGE_CONSUMER_SCAN_PREVIOUS); }
   
   // --- SAMSUNG TV CONTROL ---
-  else if (cmd == "tv_power") { sendConsumerCommand(0x0030); } 
-  else if (cmd == "tv_123") { sendConsumerCommand(0x0040); }     
-  else if (cmd == "tv_home") { sendKeycode(0x00, 0x08); }       
-  else if (cmd == "tv_back") { sendKeycode(0x29); }             
-  else if (cmd == "tv_play") { sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE); }
-  else if (cmd == "tv_ch_up") { sendConsumerCommand(0x009C); } 
+  else if (cmd == "tv_power")   { sendConsumerCommand(0x0030); } 
+  else if (cmd == "tv_123")     { sendConsumerCommand(0x0040); }     
+  else if (cmd == "tv_home")    { sendKeycode(0x00, 0x08); }       
+  else if (cmd == "tv_back")    { sendKeycode(0x29, 0); }             
+  else if (cmd == "tv_play")    { sendConsumerCommand(HID_USAGE_CONSUMER_PLAY_PAUSE); }
+  else if (cmd == "tv_ch_up")   { sendConsumerCommand(0x009C); } 
   else if (cmd == "tv_ch_down") { sendConsumerCommand(0x009D); } 
-  else if (cmd == "tv_up") { sendKeycode(0x52); }
-  else if (cmd == "tv_down") { sendKeycode(0x51); }
-  else if (cmd == "tv_left") { sendKeycode(0x50); }
-  else if (cmd == "tv_right") { sendKeycode(0x4F); }
-  else if (cmd == "tv_enter") { sendKeycode(0x28); }
-  else if (cmd == "tv_a") { sendKeycode(0x3A); } 
-  else if (cmd == "tv_b") { sendKeycode(0x3B); } 
-  else if (cmd == "tv_c") { sendKeycode(0x3C); } 
-  else if (cmd == "tv_d") { sendKeycode(0x3D); } 
+  else if (cmd == "tv_up")      { sendKeycode(0x52, 0); }
+  else if (cmd == "tv_down")    { sendKeycode(0x51, 0); }
+  else if (cmd == "tv_left")    { sendKeycode(0x50, 0); }
+  else if (cmd == "tv_right")   { sendKeycode(0x4F, 0); }
+  else if (cmd == "tv_enter")   { sendKeycode(0x28, 0); }
+  else if (cmd == "tv_a")       { sendKeycode(0x3A, 0); } 
+  else if (cmd == "tv_b")       { sendKeycode(0x3B, 0); } 
+  else if (cmd == "tv_c")       { sendKeycode(0x3C, 0); } 
+  else if (cmd == "tv_d")       { sendKeycode(0x3D, 0); } 
 }
 
 // === 5. HOME ASSISTANT MQTT AUTO-DISCOVERY ===
@@ -275,6 +317,13 @@ void publishHADiscovery() {
   publishButtonDiscovery("sleep", "Sleep PC", "sleep", "mdi:sleep", devInfo);
   publishButtonDiscovery("power", "Power Off PC", "power", "mdi:power", devInfo);
   publishButtonDiscovery("enter", "Send Enter", "enter", "mdi:keyboard-return", devInfo);
+  
+  // PC Hotkeys
+  publishButtonDiscovery("ctrl_alt_del", "Ctrl+Alt+Del", "ctrl_alt_del", "mdi:keyboard-outline", devInfo);
+  publishButtonDiscovery("win_l", "Lock Screen (Win+L)", "win_l", "mdi:lock", devInfo);
+  publishButtonDiscovery("taskmgr", "Task Manager", "taskmgr", "mdi:chart-box-outline", devInfo);
+  publishButtonDiscovery("alt_f4", "Close Window (Alt+F4)", "alt_f4", "mdi:window-close", devInfo);
+  publishButtonDiscovery("reboot_pc", "Restart PC", "reboot_pc", "mdi:restart", devInfo);
 
   // Media Buttons
   publishButtonDiscovery("vol_up", "Volume Up", "vol_up", "mdi:volume-high", devInfo);
@@ -301,28 +350,25 @@ void publishHADiscovery() {
   publishButtonDiscovery("tv_c", "TV Yellow", "tv_c", "mdi:alpha-c-box", devInfo);
   publishButtonDiscovery("tv_d", "TV Blue", "tv_d", "mdi:alpha-d-box", devInfo);
 
-  // Status Sensor (Text)
+  // Sensors
   String topicStatus = "homeassistant/sensor/" + deviceId + "/status/config";
   String payloadStatus = "{\"name\":\"Board Status\",\"stat_t\":\"pc/status\",\"ic\":\"mdi:information-outline\",\"uniq_id\":\"" + deviceId + "_status\"" + devInfo + "}";
   mqttClient.beginMessage(topicStatus, (unsigned long)payloadStatus.length(), true, 1, false);
   mqttClient.print(payloadStatus);
   mqttClient.endMessage();
 
-  // Type Text Entity
   String topicText = "homeassistant/text/" + deviceId + "/type/config";
   String payloadText = "{\"name\":\"Type Text\",\"cmd_t\":\"pc/type\",\"mode\":\"text\",\"ic\":\"mdi:keyboard-outline\",\"uniq_id\":\"" + deviceId + "_text\"" + devInfo + "}";
   mqttClient.beginMessage(topicText, (unsigned long)payloadText.length(), true, 1, false);
   mqttClient.print(payloadText);
   mqttClient.endMessage();
 
-  // Host Power Binary Sensor (ON/OFF)
   String topicHostPower = "homeassistant/binary_sensor/" + deviceId + "/host_power/config";
   String payloadHostPower = "{\"name\":\"Host Power\",\"stat_t\":\"pc/host_power\",\"dev_cla\":\"power\",\"uniq_id\":\"" + deviceId + "_host_power\"" + devInfo + "}";
   mqttClient.beginMessage(topicHostPower, (unsigned long)payloadHostPower.length(), true, 1, false);
   mqttClient.print(payloadHostPower);
   mqttClient.endMessage();
 
-  // Sensor "Last Action"
   String topicLastAction = "homeassistant/sensor/" + deviceId + "/last_action/config";
   String payloadLastAction = "{\"name\":\"Last Action\",\"stat_t\":\"pc/last_action\",\"ic\":\"mdi:history\",\"uniq_id\":\"" + deviceId + "_last_action\"" + devInfo + "}";
   mqttClient.beginMessage(topicLastAction, (unsigned long)payloadLastAction.length(), true, 1, false);
@@ -415,7 +461,7 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
   <div class="badge">IP: <b>%IP%</b></div>
   <div class="badge">Wi-Fi: %WIFI_STATUS%</div>
   <div class="badge">MQTT: %MQTT_STATUS%</div>
-  <div class="badge">Host: %HOST_STATUS%</div>
+  <div class="badge" id="host-badge">Host: %HOST_STATUS%</div>
 </div>
 
 <div class="nav">
@@ -428,15 +474,24 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
 <div id="tab-control" class="tab-content">
   <div class="card" style="max-width:360px; width:100%;">
     <h3>PC Power & Input</h3>
-    <div class="btn-grid">
+    
+    <div class="btn-grid-3">
       <button onclick="fetch('/wake')">Wake Up</button>
-      <button onclick="fetch('/enter')">Enter</button>
       <button onclick="fetch('/sleep')">Sleep</button>
       <button onclick="fetch('/power')">Power Off</button>
     </div>
+
+    <div class="btn-grid">
+      <button onclick="fetch('/ctrl_alt_del')">Ctrl+Alt+Del</button>
+      <button onclick="fetch('/win_l')">Win+L (Lock)</button>
+      <button onclick="fetch('/taskmgr')">Task Manager</button>
+      <button onclick="fetch('/alt_f4')">Alt+F4</button>
+    </div>
+
     <div style="display:flex; gap:6px;">
       <input type="text" id="str" placeholder="Text / Password (ENG)">
-      <button onclick="sendText()" style="width:auto; padding:0 16px;">Type</button>
+      <button onclick="sendText()" style="width:auto; padding:0 12px;">Type</button>
+      <button onclick="fetch('/enter')" style="width:auto; padding:0 12px;">Enter</button>
     </div>
   </div>
 
@@ -450,6 +505,10 @@ hr{border:0;border-top:1px solid var(--border);margin:12px 0;}
       <button onclick="fetch('/play_pause')">⏯ Play</button>
       <button onclick="fetch('/next')">⏭ Next</button>
     </div>
+  </div>
+  
+  <div class="reboot-container" style="margin-bottom: 20px;">
+    <button class="btn-red" onclick="rebootPC()">Restart PC</button>
   </div>
 </div>
 
@@ -612,6 +671,26 @@ function rebootESP(){
     setTimeout(() => location.reload(), 5000);
   }
 }
+
+function rebootPC(){
+  if(confirm('Restart the PC? All unsaved data will be lost.')){
+    fetch('/reboot_pc');
+  }
+}
+
+// Поллинг статуса хоста для бейджа
+setInterval(() => {
+  fetch('/api/status')
+    .then(r => r.json())
+    .then(data => {
+      const el = document.getElementById('host-badge');
+      if (el) {
+        el.innerHTML = 'Host: ' + (data.host 
+          ? "<span class='dot dot-green'></span> <b>ON</b>" 
+          : "<span class='dot dot-red'></span> <b>OFF</b>");
+      }
+    }).catch(() => {});
+}, 2000);
 </script></body></html>)rawliteral";
 
 void onMqttMessage(int messageSize) {
@@ -631,11 +710,10 @@ void onMqttMessage(int messageSize) {
 void setup() {
   Serial.begin(115200);
   
-  // Автоопределение железа и динамическое создание светодиода
   detectHardware();
   strip = new Adafruit_NeoPixel(1, ledPin, NEO_GRB + NEO_KHZ800);
   strip->begin();
-  setStatusColor(255, 140, 0); // Orange = Booting
+  setStatusColor(255, 140, 0, 20); // Orange = Booting
 
   sessionToken = String(esp_random(), HEX);
   Serial.println("\n--- ESP32-S3 Controller Booting ---");
@@ -650,7 +728,6 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-  // Load preferences
   preferences.begin("cfg", false);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("pass", "");
@@ -668,7 +745,7 @@ void setup() {
   // === INIT USB ===
   USB.VID(0x046D); 
   USB.PID(0xC323); 
-  USB.productName("Logitech Total Keyboard V1.2");
+  USB.productName("Logitech Total Keyboard V1.4");
   USB.manufacturerName("Logitech");
   USB.usbAttributes(0xA0); // WAKEUP FLAG
 
@@ -677,7 +754,6 @@ void setup() {
   USB.begin();
   Serial.println("USB HID Stack Initialized.");
 
-  // Connect to Wi-Fi
   if (ssid.length() > 0) {
     Serial.print("Connecting to Wi-Fi: ");
     Serial.println(ssid);
@@ -696,14 +772,13 @@ void setup() {
     Serial.println("Failed to connect to Wi-Fi. Starting Access Point mode.");
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-Setup-AP", "12345678");
-    setStatusColor(255, 0, 0); // Red = AP Mode / Error
+    setStatusColor(255, 0, 0, 20); // Red = AP Mode / Error
   } else {
-    setStatusColor(0, 0, 255); // Blue = Wi-Fi Connected
+    setStatusColor(0, 0, 255, 20); // Blue = Wi-Fi Connected
     Serial.print("Connected! IP Address: ");
     Serial.println(WiFi.localIP());
   }
 
-  // --- Web Server Endpoints ---
   server.on("/", []() {
     if (!isAuthenticated()) { 
       server.send(200, "text/html", loginPage); 
@@ -742,6 +817,12 @@ void setup() {
     page.replace("%WEB_PASS%", webPass.length() > 0 ? "********" : "");
     
     server.send(200, "text/html", page);
+  });
+
+  server.on("/api/status", []() {
+    if (!isAuthenticated()) { server.send(401); return; }
+    String json = "{\"host\":" + String(lastHostStatus ? "true" : "false") + "}";
+    server.send(200, "application/json", json);
   });
 
   server.on("/login", HTTP_POST, []() {
@@ -807,10 +888,15 @@ void setup() {
   });
 
   // Action Endpoints: PC
-  server.on("/wake",  []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("wake"); server.send(200,"text/plain","OK"); });
-  server.on("/sleep", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("sleep"); server.send(200,"text/plain","OK"); });
-  server.on("/power", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("power"); server.send(200,"text/plain","OK"); });
-  server.on("/enter", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("enter"); server.send(200,"text/plain","OK"); });
+  server.on("/wake",         []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("wake");         server.send(200,"text/plain","OK"); });
+  server.on("/sleep",        []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("sleep");        server.send(200,"text/plain","OK"); });
+  server.on("/power",        []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("power");        server.send(200,"text/plain","OK"); });
+  server.on("/enter",        []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("enter");        server.send(200,"text/plain","OK"); });
+  server.on("/ctrl_alt_del", []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("ctrl_alt_del"); server.send(200,"text/plain","OK"); });
+  server.on("/win_l",        []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("win_l");        server.send(200,"text/plain","OK"); });
+  server.on("/taskmgr",      []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("taskmgr");      server.send(200,"text/plain","OK"); });
+  server.on("/alt_f4",       []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("alt_f4");       server.send(200,"text/plain","OK"); });
+  server.on("/reboot_pc",    []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("reboot_pc");    server.send(200,"text/plain","OK"); });
 
   // Action Endpoints: Media
   server.on("/vol_up",     []() { if(!isAuthenticated()){server.send(401);return;} executeCommand("vol_up"); server.send(200,"text/plain","OK"); });
@@ -846,7 +932,6 @@ void setup() {
     server.send(200, "text/plain", "OK");
   });
 
-  // OTA Update
   server.on("/update", HTTP_POST, []() {
     if (!isAuthenticated()) { server.send(401, "text/plain", "Unauthorized"); return; }
     server.sendHeader("Connection", "close");
@@ -854,10 +939,7 @@ void setup() {
     delay(500); 
     ESP.restart();
   }, []() {
-    if (!isAuthenticated()) { 
-      Update.abort(); 
-      return; 
-    }
+    if (!isAuthenticated()) { Update.abort(); return; }
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
       Serial.printf("OTA Update Start: %s\n", upload.filename.c_str());
@@ -884,7 +966,6 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Hardware Factory Reset Check
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
     if (!buttonHeld) {
       buttonHeld = true;
@@ -902,13 +983,12 @@ void loop() {
     buttonHeld = false;
   }
 
-  // Network & MQTT Connection Manager (checks every 4 seconds)
   if (millis() - lastNetworkCheck > 4000) {
     lastNetworkCheck = millis();
 
     if (ssid.length() > 0) {
       if (WiFi.status() != WL_CONNECTED) {
-        setStatusColor(255, 140, 0); 
+        setStatusColor(255, 140, 0, 20); 
         if (millis() - lastWifiAttempt > 15000) {
           lastWifiAttempt = millis();
           Serial.println("Wi-Fi disconnected. Attempting to reconnect...");
@@ -916,51 +996,31 @@ void loop() {
         }
       } else {
         if (mqttServer.length() > 0 && !mqttClient.connected()) {
-          setStatusColor(0, 0, 255); 
+          setStatusColor(0, 0, 255, 20); 
           Serial.println("Connecting to MQTT broker...");
-          
-          if (mqttUser.length() > 0) { 
-            mqttClient.setUsernamePassword(mqttUser, mqttPass); 
-          }
-
-          // === НАСТРОЙКА LWT (LAST WILL) ===
+          if (mqttUser.length() > 0) { mqttClient.setUsernamePassword(mqttUser, mqttPass); }
           mqttClient.beginWill("pc/status", 7, true, 1);
           mqttClient.print("offline");
           mqttClient.endWill();
-          // =================================
-          
-          // === УВЕЛИЧЕНИЕ БУФЕРА ДЛЯ DISCOVERY ===
           mqttClient.setTxPayloadSize(1024);
-          // =======================================
 
           if (mqttClient.connect(mqttServer.c_str(), mqttPort)) {
-            Serial.println("MQTT Connected! Subscribing and publishing discovery...");
-            
-            // 1. Сразу отправляем статус, пока буфер MQTT свободен!
+            Serial.println("MQTT Connected!");
             publishStatus("online");
-            mqttClient.poll(); // Даем библиотеке команду немедленно протолкнуть пакет
-            
-            // 2. Только теперь подписываемся и шлем тяжелые конфигурации
+            mqttClient.poll(); 
             mqttClient.subscribe("pc/command");
             mqttClient.subscribe("pc/type");
             publishHADiscovery();
-            
-            setStatusColor(0, 255, 0); // Green = Fully connected
-          } else {
-            Serial.print("MQTT Connection failed! Error code: ");
-            Serial.println(mqttClient.connectError());
+            setStatusColor(0, 255, 0, 20); 
           }
         }
       }
     }
   }
 
-  // Handle incoming MQTT messages
   if (mqttClient.connected()) {
     mqttClient.poll();
     
-    // --- HOST POWER TRACKING (tud_mounted) ---
-    // Checks every 1 second to see if the host (TV/PC) is supplying power/data to the USB port
     if (millis() - lastHostStatusCheck > 1000) {
       lastHostStatusCheck = millis();
       bool currentHostStatus = tud_mounted() && !tud_suspended();
@@ -969,10 +1029,6 @@ void loop() {
         lastHostStatus = currentHostStatus;
         hostStatusInitialized = true;
         
-        Serial.print("Host Power State Changed: ");
-        Serial.println(currentHostStatus ? "ON" : "OFF");
-        
-        // Publish state to MQTT with Retain = true
         String hpState = currentHostStatus ? "ON" : "OFF";
         mqttClient.beginMessage("pc/host_power", (unsigned long)hpState.length(), true, 1, false); 
         mqttClient.print(hpState);
