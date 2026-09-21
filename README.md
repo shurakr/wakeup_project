@@ -9,10 +9,11 @@ The core highlight of this project is a 100% reliable **hardware wake-up from AC
 
 ---
 
-## 🌟 Key Features (v1.2)
+## 🌟 Key Features (v1.4)
 
 *   **Composite USB HID (4-in-1):** Emulates Keyboard, Mouse, Consumer Control (Media keys), and ACPI System Control over a single native USB link.
 *   **Guaranteed Wake-on-USB:** Generates native bus interrupts (`Remote Wakeup`), a mouse click, and an ACPI Wake signal to reliably resume modern PCs and laptops from deep sleep.
+*   **Essential PC Hotkeys & Safe Reboot:** Native triggers for `Ctrl+Alt+Del`, `Win+L` (Lock Screen), `Ctrl+Shift+Esc` (Task Manager), and `Alt+F4`. Includes an OS-level graceful reboot macro (`Win+R` -> `shutdown /r /t 0` -> `Enter`) guarded by a confirmation prompt.
 *   **Samsung Smart TV Integration:** Dedicated virtual remote control interface (D-Pad navigation, OK, Back, Home, 123 Menu, Color buttons A/B/C/D, Channels).
 *   **Host Power Detection:** Real-time hardware tracking of the USB host power state (`ON`/`OFF` binary sensor in Home Assistant and Web UI via `tud_mounted`).
 *   **Anti-Freeze Protection:** Non-blocking TinyUSB FIFO buffer handling (`tud_hid_ready()`) ensures the controller never crashes when sending commands to a sleeping or disconnected device.
@@ -22,7 +23,7 @@ The core highlight of this project is a 100% reliable **hardware wake-up from AC
     *   🔵 **Blue:** Connected to Wi-Fi, connecting to MQTT.
     *   🟢 **Green:** Fully online and synchronized.
     *   🔴 **Red:** Access Point (Setup) Mode or Factory Reset.
-*   **Modern Web UI:** Three-tab dark dashboard (PC Control, Samsung TV, Settings) with live status indicators (IP, Wi-Fi, MQTT, Host Power).
+*   **Modern Web UI with Dynamic Polling:** Three-tab dark dashboard (PC Control, Samsung TV, Settings) featuring live background polling (`/api/status`) that updates the host power badge without refreshing the page.
 *   **PlatformIO Ready:** Pre-configured environments for 4MB/QSPI and 16MB/OPI boards.
 *   **OTA & Recovery:** Web-based OTA firmware updates (`.bin`) and hardware factory reset (hold BOOT for 5 seconds).
 
@@ -78,7 +79,8 @@ Ensure **ESP32 Core 3.x+** is installed:
 ## 📡 MQTT Interface
 
 ### Command Topic: `pc/command`
-*   **PC Power:** `wake`, `sleep`, `power`, `enter`.
+*   **PC Power & Macros:** `wake`, `sleep`, `power`, `enter`, `reboot_pc`.
+*   **PC Hotkeys:** `ctrl_alt_del`, `win_l`, `taskmgr`, `alt_f4`.
 *   **Media:** `vol_up`, `vol_down`, `mute`, `play_pause`, `next`, `prev`.
 *   **Samsung TV:** `tv_power`, `tv_123`, `tv_home`, `tv_back`, `tv_play`, `tv_ch_up`, `tv_ch_down`, `tv_up`, `tv_down`, `tv_left`, `tv_right`, `tv_enter`, `tv_a`, `tv_b`, `tv_c`, `tv_d`.
 
@@ -96,7 +98,7 @@ Publishes ASCII characters directly to the active host window (ideal for sending
 
 1.  **BIOS/UEFI:** Ensure *USB Wake Support*, *Always On USB*, or *Power On By USB* is enabled.
 2.  **Windows Device Manager:**
-    *   Under **Keyboards** $\rightarrow$ `Logitech Total Keyboard V1.2` $\rightarrow$ **Properties** $\rightarrow$ **Power Management**.
+    *   Under **Keyboards** $\rightarrow$ `Logitech Total Keyboard V1.4` $\rightarrow$ **Properties** $\rightarrow$ **Power Management**.
     *   Check **"Allow this device to wake the computer"**.
     *   Repeat under **Mice and other pointing devices**.
 
